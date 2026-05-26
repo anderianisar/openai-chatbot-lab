@@ -1,283 +1,205 @@
-import os
-import sys
-
-# =========================================================
-# 🔥 CRITICAL FIXES (MUST BE FIRST)
-# Fixes system crashes on Streamlit Cloud hosting
-# =========================================================
-os.environ["ANONYMIZED_TELEMETRY"] = "False"  # Silences background telemetry log alerts
-os.environ["PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION"] = "python"  # Fixes protobuf crash
-
-# Fixes outdated Linux SQLite engines on Streamlit Cloud containers
-try:
-    import pysqlite3
-    sys.modules["sqlite3"] = sys.modules.pop("pysqlite3")
-except ImportError:
-    pass
-
 import streamlit as st
+import os
 import chromadb
-from chromadb.config import Settings
-import requests
-import pypdf
-from chromadb.api.types import EmbeddingFunction
-from langchain_openai import ChatOpenAI
+
+from dotenv import load_dotenv
+from google import genai
+from langchain_community.document_loaders import DirectoryLoader, TextLoader
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 # =========================================================
 # PAGE CONFIG
 # =========================================================
 st.set_page_config(
-    page_title="Company RAG Assistant",
+    page_title="Company AI Assistant",
     page_icon="🤖",
-    layout="wide",
-    initial_sidebar_state="expanded"
+    layout="wide"
 )
 
-# Fetch from Streamlit Cloud Secrets Manager securely
-OPENROUTER_API_KEY = st.secrets["OPENROUTER_API_KEY"]
+# =========================================================
+# LOAD ENV
+# =========================================================
+load_dotenv()
+
+API_KEY = os.getenv("Gemini_API_Key")
+
+if not API_KEY:
+    st.error("❌ Gemini API key not found in .env (Course_AI_Lab)")
+    st.stop()
 
 # =========================================================
-# EMBEDDING FUNCTION (OPENROUTER SAFE)
+# GEMINI CLIENT
 # =========================================================
-class OpenRouterEmbeddingFunction(EmbeddingFunction):
-    def __init__(self, api_key, model="openai/text-embedding-3-small"):
-        self.api_key = api_key
-        self.model = model
+@st.cache_resource
+def init_gemini():
+    return genai.Client(api_key=API_KEY)
 
-    def __call__(self, input):
-        if isinstance(input, str):
-            input = [input]
-
-        response = requests.post(
-            "https://openrouter.ai/api/v1/embeddings",
-            headers={
-                "Authorization": f"Bearer {self.api_key}",
-                "Content-Type": "application/json"
-            },
-            json={
-                "model": self.model,
-                "input": input
-            }
-        )
-
-        if response.status_code != 200:
-            raise ValueError(f"Embedding Error: {response.text}")
-
-        data = response.json()["data"]
-        return [
-            [float(x) for x in item["embedding"]]
-            for item in data
-        ]
+gemini_client = init_gemini()
 
 # =========================================================
-# CHROMADB INIT (Safe Singleton Configuration)
+# EMBEDDING FUNCTION
+# =========================================================
+def get_embedding(text):
+    response = gemini_client.models.embed_content(
+        model="gemini-embedding-001",
+        contents=text
+    )
+    return response.embeddings[0].values
+
+# =========================================================
+# CHROMA DB
 # =========================================================
 @st.cache_resource
 def init_chromadb():
-    client = chromadb.PersistentClient(
-        path="./chroma_db",
-        settings=Settings(allow_reset=True, anonymized_telemetry=False)
+    client = chromadb.PersistentClient(path="./chroma_db")
+    collection = client.get_or_create_collection(
+        name="company_documents"
     )
-    embedding_fn = OpenRouterEmbeddingFunction(
-        api_key=OPENROUTER_API_KEY,
-        model="openai/text-embedding-3-small"
-    )
-    return client.get_or_create_collection(
-        name="company_docs",
-        embedding_function=embedding_fn
-    )
-
-# =========================================================
-# LLM INIT
-# =========================================================
-@st.cache_resource
-def init_llm():
-    return ChatOpenAI(
-        model="meta-llama/llama-3-70b-instruct",
-        temperature=0.2,
-        api_key=OPENROUTER_API_KEY,
-        base_url="https://openrouter.ai/api/v1",
-        # Tricks Pydantic into bypassing local token structure validations
-        openai_api_key="placeholder-to-bypass-pydantic-validation"
-    )
+    return collection
 
 collection = init_chromadb()
-llm = init_llm()
 
 # =========================================================
-# RAG FUNCTION (HYBRID SEMANTIC VS KEYWORD MODES)
+# BUILD KNOWLEDGE BASE (IMPORTANT FIX)
 # =========================================================
-def get_rag_response(query, n_results=3, search_mode="Semantic Search"):
+def build_knowledge_base():
+    loader = DirectoryLoader(
+        "company_documents/",
+        glob="*.txt",
+        loader_cls=TextLoader
+    )
+
+    documents = loader.load()
+
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=500,
+        chunk_overlap=50
+    )
+
+    chunks = splitter.split_documents(documents)
+
+    texts = [c.page_content for c in chunks]
+
+    embeddings = [get_embedding(t) for t in texts]
+
+    collection.add(
+        documents=texts,
+        embeddings=embeddings,
+        ids=[f"doc_{i}" for i in range(len(texts))],
+        metadatas=[
+            {"source": c.metadata.get("source", "unknown")}
+            for c in chunks
+        ]
+    )
+
+# 👉 AUTO FIX: build DB if empty
+if collection.count() == 0:
+    with st.spinner("📚 Building knowledge base..."):
+        build_knowledge_base()
+
+# =========================================================
+# LLM
+# =========================================================
+from langchain_google_genai import ChatGoogleGenerativeAI
+
+llm = ChatGoogleGenerativeAI(
+    model="gemini-2.5-flash",
+    google_api_key=API_KEY,
+    temperature=0
+)
+
+# =========================================================
+# RAG FUNCTION
+# =========================================================
+def get_rag_response(query, n_results=3):
+
     try:
-        # Check if database has files before querying to prevent index panics
-        if collection.count() == 0:
-            return "⚠️ The knowledge base is currently empty. Please drop policy files into the folder uploader in the sidebar."
+        # Embed query
+        query_embedding = get_embedding(query)
 
-        # Execute search strategy based on user selection
-        if search_mode == "Keyword Search":
-            # 🔑 KEYWORD MATCHING: Literal character substring scan using Chroma's where_document filter
-            results = collection.get(
-                where_document={"$contains": query},
-                limit=n_results
-            )
-            docs = [results.get("documents", [])]
-        else:
-            # 🧠 SEMANTIC RETRIEVAL: High-dimensional vector cosine distance matching
-            results = collection.query(
-                query_texts=[query],
-                n_results=n_results
-            )
-            docs = results.get("documents")
+        # Search Chroma
+        results = collection.query(
+            query_embeddings=[query_embedding],
+            n_results=n_results
+        )
 
-        if not docs or not docs[0] or len(docs[0]) == 0 or not docs[0][0].strip():
-            return f"❌ No relevant information found using {search_mode} matching paths."
+        docs = results["documents"][0]
 
-        docs = docs[0]
+        if not docs:
+            return "I don't know based on the provided documents."
+
         context = "\n\n---\n\n".join(docs)
 
-        messages = [
-            {
-                "role": "system",
-                "content": (
-                    "You are a professional HR assistant. Use ONLY the provided context "
-                    "to answer questions. If the answer cannot be found or deduced from the "
-                    "context, state clearly that you do not know."
-                )
-            },
-            {
-                "role": "user",
-                "content": f"Context:\n{context}\n\nQuestion:\n{query}\n\nAnswer clearly and professionally:"
-            }
-        ]
+        prompt = f"""
+You are a professional HR assistant.
 
-        response = llm.invoke(messages)
+Answer ONLY using the context below.
+
+If not found, say:
+"I don't know based on the provided documents."
+
+Context:
+{context}
+
+Question:
+{query}
+
+Answer:
+"""
+
+        response = llm.invoke(prompt)
+
         return response.content
 
     except Exception as e:
-        return f"⚠️ Error processing request: {str(e)}"
+        return f"Error: {str(e)}"
 
 # =========================================================
-# SESSION STATE
+# STREAMLIT UI
 # =========================================================
+st.title("🤖 Company Knowledge Base AI Assistant")
+st.caption("Powered by Gemini + ChromaDB + RAG")
+
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
-# =========================================================
-# SIDEBAR (FOLDER & MULTI-FILE DOCUMENT UPLOADER)
-# =========================================================
-with st.sidebar:
-    st.title("🤖 AI HR Assistant")
-    st.caption("RAG Pipeline Engine")
-    
-    st.markdown("""
-    - **Search Engine:** Hybrid Processing
-    - **Database:** Local ChromaDB Context
-    - **LLM Endpoint:** OpenRouter Gateway
-    """)
-    st.divider()
-
-    # 🏢 DIRECT FOLDER/FILE INGESTION CONTROL INTERFACE (Syntax Error Resolved)
-    st.subheader("Upload Company Knowledge")
-    
-    # Drag and drop or browse multiple files simultaneously
-    uploaded_files = st.file_uploader(
-        "Select PDF or TXT files", 
-        type=["pdf", "txt"], 
-        accept_multiple_files=True
-    )
-    
-    if uploaded_files:
-        if st.button("Process & Save to Vector Space", use_container_width=True, type="secondary"):
-            for uploaded_file in uploaded_files:
-                file_name = uploaded_file.name
-                
-                with st.spinner(f"Processing {file_name}..."):
-                    try:
-                        text_content = ""
-                        
-                        # 1. Parse PDF formats
-                        if file_name.endswith(".pdf"):
-                            pdf_reader = pypdf.PdfReader(uploaded_file)
-                            for page in pdf_reader.pages:
-                                page_text = page.extract_text()
-                                if page_text:
-                                    text_content += page_text + "\n"
-                        
-                        # 2. Parse Raw TXT formats
-                        elif file_name.endswith(".txt"):
-                            text_content = uploaded_file.read().decode("utf-8")
-                        
-                        # 3. Vectorize chunks and update DB collection
-                        if text_content.strip():
-                            collection.add(
-                                ids=[file_name],  # Uses file name as the unique key
-                                documents=[text_content.strip()],
-                                metadatas=[{"source": "local_upload", "filename": file_name}]
-                            )
-                            st.success(f"Indexed: {file_name}")
-                        else:
-                            st.warning(f"Skipped {file_name} (No readable text found).")
-                            
-                    except Exception as ex:
-                        st.error(f"Error reading {file_name}: {ex}")
-            
-            st.success("All files processed successfully!")
-            st.rerun()
-
-    st.divider()
-
-    # Dynamic metrics tracker
-    col1, col2 = st.columns(2)
-    with col1:
-        try:
-            doc_count = collection.count()
-        except Exception:
-            doc_count = 0
-        st.metric("📄 Indexed Docs", doc_count)
-    with col2:
-        st.metric("💬 Messages", len(st.session_state.messages))
-
-    st.divider()
-
-    if st.button("🧹 Clear Chat History", use_container_width=True, type="primary"):
-        st.session_state.messages = []
-        st.rerun()
-
-# =========================================================
-# MAIN INTERFACE HEADER
-# =========================================================
-st.title("Company Knowledge Assistant")
-st.caption("Strategic RAG Analytics + Semantic Knowledge Base Mapping")
-st.markdown("---")
-
-# =========================================================
-# CHAT HISTORY DISPLAY
-# =========================================================
+# Chat history
 for msg in st.session_state.messages:
     with st.chat_message(msg["role"]):
-        st.write(msg["content"])
+        st.markdown(msg["content"])
 
-# =========================================================
-# CHAT INPUT & EXECUTION
-# =========================================================
-# Interactive Strategy Engine Selector
-search_strategy = st.radio(
-    "Select Context Search Strategy:",
-    options=["Semantic Search", "Keyword Search"],
-    horizontal=True,
-    help="Semantic handles underlying meaning context. Keyword strictly scans for literal character phrase matches."
-)
+# Input
+prompt = st.chat_input("Ask about company policies...")
 
-if prompt := st.chat_input("Ask a question about company policies..."):
+if prompt:
 
     st.session_state.messages.append({"role": "user", "content": prompt})
 
     with st.chat_message("user"):
-        st.write(prompt)
+        st.markdown(prompt)
 
     with st.chat_message("assistant"):
-        with st.spinner(f"Running context map ({search_strategy})..."):
-            response = get_rag_response(prompt, search_mode=search_strategy)
-        st.write(response)
+        with st.spinner("Searching knowledge base..."):
+            answer = get_rag_response(prompt)
 
-    st.session_state.messages.append({"role": "assistant", "content": response})
+        st.markdown(answer)
+
+    st.session_state.messages.append({"role": "assistant", "content": answer})
+
+# =========================================================
+# SIDEBAR INFO
+# =========================================================
+with st.sidebar:
+    st.title("🏢 Company AI")
+
+    st.metric("Documents Indexed", collection.count())
+    st.metric("Model", "Gemini 2.5 Flash")
+    st.metric("Embeddings", "Gemini")
+
+    st.markdown("### Example Questions")
+    st.markdown("- What is leave policy?")
+    st.markdown("- Can I work remotely?")
+    st.markdown("- Maternity benefits?")
+
+
+   
